@@ -42,6 +42,14 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+try:
+    # Predicate for whether torch.distributed is routed through TorchComms.
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
@@ -75,6 +83,29 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
+
+def _device_backend_str(torch_distributed_backend) -> str:
+    """Normalize a backend to the ``"<device>:<backend>"`` form required by
+    ``split_group``'s ``backend`` filter (TorchComms path).
+
+    Accepts a bare backend name (e.g. ``"nccl"``) or an already device-prefixed
+    string (e.g. ``"cuda:nccl"``), returning a single device-qualified backend.
+    """
+    backend_str = str(torch_distributed_backend)
+    if ":" in backend_str:
+        return backend_str
+    if is_cuda_alike():
+        device = "cuda"
+    elif _is_npu:
+        device = "npu"
+    elif _is_xpu:
+        device = "xpu"
+    elif _is_musa:
+        device = "musa"
+    else:
+        device = "cpu"
+    return f"{device}:{backend_str}"
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -312,6 +343,27 @@ class GroupCoordinator:
                     backend="mooncake-cpu",
                     pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
                     timeout=subgroup_timeout,
+                )
+            elif _use_torchcomms_enabled():
+                # Under TorchComms, new_group() creates subgroups via split_group,
+                # whose backend filter must be device-qualified and must include
+                # the parent PG's default (device_id-bound) device type. Pass the
+                # device backend for the device group so device collectives run
+                # over nccl, and cpu:gloo + the device backend for the CPU group
+                # (only gloo is used for CPU collectives; the device backend is
+                # present solely to satisfy the default-device-type requirement).
+                # The world PG is eagerly created with both backends and a bound
+                # device_id in init_distributed_environment().
+                device_backend_str = _device_backend_str(torch_distributed_backend)
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend=device_backend_str,
+                    timeout=subgroup_timeout,
+                )
+                cpu_group = torch.distributed.new_group(
+                    ranks,
+                    backend=f"cpu:gloo,{device_backend_str}",
+                    timeout=gloo_timeout,
                 )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
@@ -1801,24 +1853,50 @@ def init_distributed_environment(
 
         _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
 
-        if backend == "mooncake":
-            from mooncake.ep import MooncakeBackendOptions
-
-            # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
-            active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
-            pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
+        if _use_torchcomms_enabled() and is_cuda_alike() and backend != "gloo":
+            # TorchComms creates the TP/PP subgroups via split_group, which can
+            # only select per-device backends already present on the world PG and
+            # requires it to be eagerly device-bound. So the world PG must be
+            # created with both a cpu (gloo) and device (nccl) backend and a
+            # bound device_id. ``backend`` itself stays the bare device backend
+            # so each subgroup is split with the device-qualified filter (device
+            # collectives run over nccl, CPU coordination over gloo) -- see
+            # GroupCoordinator.__init__. split_group needs local_rank early to
+            # compute the device_id.
+            tc_local_rank = local_rank
+            if tc_local_rank == -1:
+                tc_local_rank = (
+                    int(os.environ.get("LOCAL_RANK", "0"))
+                    if distributed_init_method == "env://"
+                    else rank
+                )
+            torch.distributed.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank,
+                timeout=timeout,
+                device_id=torch.device(f"cuda:{tc_local_rank}"),
+            )
         else:
-            pg_options = get_torch_distributed_pg_options()
+            if backend == "mooncake":
+                from mooncake.ep import MooncakeBackendOptions
 
-        # this backend is used for WORLD
-        torch.distributed.init_process_group(
-            backend=backend,
-            init_method=distributed_init_method,
-            world_size=world_size,
-            rank=rank,
-            timeout=timeout,
-            pg_options=pg_options,
-        )
+                # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
+                active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
+                pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
+            else:
+                pg_options = get_torch_distributed_pg_options()
+
+            # this backend is used for WORLD
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank,
+                timeout=timeout,
+                pg_options=pg_options,
+            )
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":
