@@ -297,11 +297,21 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
+        # The world PG uses the in-tree "nccl2" backend (device-bound). Device
+        # subgroups (TP/DP/PP) are built members-only via new_group with the
+        # "nccl-lazy" backend and use_local_synchronization=True, so each subgroup
+        # is created only by its own members rather than collectively over the
+        # whole world. nccl-lazy allocates a dedicated comm + stream lazily, which
+        # gives PP the per-peer P2P overlap it needs. nccl2 has no backend split(),
+        # so subgroups are always bootstrapped fresh via new_group rather than
+        # split from the parent. The gloo cpu group stays a members-only new_group
+        # for direct CPU-side coordination.
+        is_mooncake = "mooncake" in torch_distributed_backend
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
             active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
-            if "mooncake" in torch_distributed_backend:
+            if is_mooncake:
                 from mooncake.ep import MooncakeBackendOptions
 
                 device_group = torch.distributed.new_group(
@@ -317,12 +327,16 @@ class GroupCoordinator:
                     timeout=subgroup_timeout,
                 )
             else:
-                pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
                     ranks,
-                    backend=torch_distributed_backend,
-                    pg_options=pg_options,
+                    backend="nccl-lazy",
+                    pg_options=get_torch_distributed_pg_options(group_name),
+                    use_local_synchronization=True,
                     timeout=subgroup_timeout,
+                    # Bind each members-only nccl-lazy subgroup to this rank's real
+                    # CUDA device so non-contiguous PP recv lands on the right
+                    # device (defensive wiring for the lazy P2P path).
+                    device_id=torch.device(f"cuda:{local_rank}"),
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -1792,6 +1806,17 @@ def init_distributed_environment(
             ) from e
         mooncake_ep.set_host_ip(get_local_ip_auto())
 
+    # Resolve local_rank up front: it is not available on a torch ProcessGroup
+    # (see https://github.com/pytorch/pytorch/issues/122816) and is needed both
+    # for the world device binding below and for init_world_group.
+    if local_rank == -1:
+        # local rank not set, this usually happens in single-node setting,
+        # where we can use rank as local rank
+        if distributed_init_method == "env://":
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        else:
+            local_rank = rank
+
     if not torch.distributed.is_initialized():
         global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
@@ -1814,30 +1839,39 @@ def init_distributed_environment(
         else:
             pg_options = get_torch_distributed_pg_options()
 
+        # Bind the world PG to its CUDA device so the members-only lazy new_group
+        # path can read bound_device_id. The world backend is routed to the in-tree
+        # "nccl2" backend; PyTorch auto-qualifies "nccl2" -> "cpu:gloo,cuda:nccl2",
+        # and members-only subgroups reuse the c10d store, so no extra MASTER_PORT
+        # or per-backend env seeding is needed.
+        device_id = (
+            torch.device(f"cuda:{local_rank}")
+            if is_cuda_alike() and backend != "gloo"
+            else None
+        )
+
+        # Route the world backend to the in-tree nccl2 backend.
+        world_backend = backend
+        if world_backend == "nccl":
+            world_backend = "nccl2"
+        elif world_backend == "cuda:nccl":
+            world_backend = "cuda:nccl2"
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
-            backend=backend,
+            backend=world_backend,
             init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
             timeout=timeout,
             pg_options=pg_options,
+            device_id=device_id,
         )
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":
             _create_global_tcp_store(rank, world_size)
 
-    # set the local rank
-    # local_rank is not available in torch ProcessGroup,
-    # see https://github.com/pytorch/pytorch/issues/122816
-    if local_rank == -1:
-        # local rank not set, this usually happens in single-node
-        # setting, where we can use rank as local rank
-        if distributed_init_method == "env://":
-            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        else:
-            local_rank = rank
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
