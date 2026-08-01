@@ -23,6 +23,71 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Backend routing for the ``split_group`` subgroup path.
+#
+# sglang-diffusion owns its own world process group (see
+# ``parallel_state.init_distributed_environment``) and pushes it into srt's
+# globals, so the routing below decides the backend for *both* frameworks in a
+# diffusion-initiated process.
+# ---------------------------------------------------------------------------
+
+# split_group selects a subset of the parent PG's *per-device* backends, so the
+# world PG must be device-qualified and it must carry "cpu:gloo" for the CPU
+# subgroups to have a gloo backend to filter for.
+SPLIT_GROUP_WORLD_BACKEND = "cpu:gloo,cuda:nccl"
+
+# Filter for a device (CUDA collective) subgroup split off the world PG.
+SPLIT_GROUP_DEVICE_BACKEND = "cuda:nccl"
+
+# Filter for a CPU-coordination subgroup split off the world PG. It has to keep
+# "cuda:nccl" as well: ProcessGroup::splitGroup requires the deviceTypes filter
+# to include the parent's default backend device type (cuda here), so a pure
+# "cpu:gloo" split is rejected outright. The resulting group is compound, which
+# is fine for CPU collectives/P2P and for dist.monitored_barrier (it checks for
+# a CPU-capable backend via group._device_types, not for the literal "gloo"
+# name).
+SPLIT_GROUP_CPU_BACKEND = "cpu:gloo,cuda:nccl"
+
+# Backend for genuinely per-peer P2P groups (pipeline parallel). "nccl-lazy"
+# defers communicator creation until first use so send/recv to different stages
+# can overlap. These groups are built members-only (see below).
+P2P_DEVICE_BACKEND = "nccl-lazy"
+
+
+def route_world_backend(backend: str | None) -> str | None:
+    """Device-qualify a requested world backend for the split_group path.
+
+    Mirrors ``sglang.srt.distributed.parallel_state.init_distributed_environment``:
+    a bare ``nccl`` becomes ``cpu:gloo,cuda:nccl``. Non-CUDA backends
+    (gloo/hccl/...) are passed through untouched.
+    """
+    if backend in ("nccl", "cuda:nccl"):
+        return SPLIT_GROUP_WORLD_BACKEND
+    return backend
+
+
+def can_split_world() -> bool:
+    """Whether the world PG can have subgroups carved off it with split_group.
+
+    Derived from the *live* world PG rather than from the requested backend
+    string: the world may have been initialized by someone else (srt, a test
+    harness, or an embedding trainer) in a shape split_group cannot use. Those
+    worlds must keep the upstream ``new_group`` path.
+    """
+    if not torch.distributed.is_initialized():
+        return False
+    world_pg = torch.distributed.group.WORLD
+    if world_pg is None:
+        return False
+    # split_group requires an eagerly device-bound parent communicator.
+    if getattr(world_pg, "bound_device_id", None) is None:
+        return False
+    # ... and a device-qualified parent carrying a cpu backend, so that both the
+    # device and the CPU subgroup filters resolve against it.
+    return "cpu:" in torch.distributed.get_backend(world_pg)
+
+
 def ensure_divisibility(numerator, denominator) -> None:
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(
