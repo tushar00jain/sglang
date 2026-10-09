@@ -72,6 +72,18 @@ _VAE: ProcessGroup | None = None
 _VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
 _REPLICA_PARALLEL_AXES = "tp-sp-pp-cfg"
 _ENCODER_DP_PARALLEL_AXES = "sp-pp-cfg"
+_PP_DEVICE_BACKEND = "nccl-lazy"
+
+
+def _pipeline_parallel_backend(backend: str) -> str:
+    if backend.rsplit(":", 1)[-1] != "nccl":
+        return backend
+
+    default_pg = torch.distributed.distributed_c10d._get_default_group()
+    resolved_backend = default_pg._get_backend(torch.device("cuda")).name()
+    if resolved_backend in {"nccl2", _PP_DEVICE_BACKEND}:
+        return _PP_DEVICE_BACKEND
+    return backend
 
 
 def get_world_group() -> GroupCoordinator:
@@ -181,6 +193,8 @@ def init_parallel_group_coordinator(
         "replica",
         "encoder_data",
     ], f"parallel_mode {parallel_mode} is not supported"
+    if parallel_mode == "pipeline":
+        backend = _pipeline_parallel_backend(backend)
     if parallel_mode == "sequence":
         return SequenceParallelGroupCoordinator(
             group_ranks=group_ranks,
