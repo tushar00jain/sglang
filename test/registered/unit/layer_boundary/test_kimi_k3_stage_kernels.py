@@ -24,7 +24,7 @@ from sglang.srt.models import kimi_k3
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 CONFIG = SimpleNamespace(
     is_moe=True, num_experts=8, first_k_dense_replace=1, moe_layer_freq=1
